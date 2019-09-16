@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Base file to setup a service
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: staging
+    Description: "The EnvironmentName used with the 'ecs.yml' template to create the cluster."
+  ServiceName:
+    Type: String
+    Default: hello-ecs
+    Description: "A service name with only lowercase letters, numbers and '-'.  Must match the ECR repository."
+  DesiredTasks:
+    Type: Number
+    Default: 2
+    Description: "The number of containers that should be run for the service."
+
+Resources:
+
+  # This is an IAM role provides service running in the container to
+  # access AWS services.  This is a substitute for passing credentials
+  # into the application as config.  The permissions should only allow
+  # access to services that the application needs to access. This is
+  # added to the ECS Task definition (TaskRoleArn)
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ["ecs-tasks.amazonaws.com"]
+            Action: ["sts:AssumeRole"]
+      Path: /
+      # Uncomment to allow permissions to specific services the
+      # application needs.
+      #Policies:
+      #  - PolicyName: ecs-service
+      #    PolicyDocument:
+      #      Statement:
+      #        - Effect: Allow
+      #          Action: []
+      #          Resource: "*"
+
+  # Application Load Balancer for access the service.  ALBTargetGroup will
+  # automatically get filled with running Service task that will used for
+  # load balancing.
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+      - Fn::ImportValue: !Sub ${EnvironmentName}:PublicSubnetOne
+      - Fn::ImportValue: !Sub ${EnvironmentName}:PublicSubnetTwo
+      SecurityGroups:
+      - Fn::ImportValue: !Sub ${EnvironmentName}:LBSecurityGroup
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn:
+            Ref: ALBTargetGroup
+      LoadBalancerArn:
+          Ref: ALB
+      Port: 80
+      Protocol: HTTP
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 60
+      UnhealthyThresholdCount: 10
+      HealthCheckPath: /
+      Port: 80
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}:VpcId
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 60
+
+  # Task definition used to create the Service in ECS cluster. The internal
+  # ContainerDefinition defines the ContainerPort which is what the
+  # application is responding on and HostPort of 0 says ECS should pick a
+  # port between 32000-64000 to allow many containers have port conflicts.
+  # The Image refers to the ECR repository, which should be seeded with
+  # "latest" image else the CloudFormation Service won't complete.
+  Task:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub ${EnvironmentName}:TasksExecutionRole
+      TaskRoleArn: !Ref TaskRole
+      ContainerDefinitions:
+        - Name: !Ref ServiceName
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ServiceName}:latest
+          MemoryReservation: "128"
+          PortMappings:
+            - HostPort: 0
+              ContainerPort: 8080
+
+
+  # ECS Service that will make sure X number of containers are running on the
+  # ECS cluster.
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListener
+    Properties:
+      Cluster:
+        Fn::ImportValue: !Sub ${EnvironmentName}:ClusterName
+      TaskDefinition: !Ref Task
+      DesiredCount: !Ref DesiredTasks
+      LoadBalancers:
+        - TargetGroupArn:
+            Ref: ALBTargetGroup
+          ContainerPort: 8080
+          ContainerName: !Ref ServiceName
+
+# These are the values output by the CloudFormation template. Be careful
+# about changing any of them, because of them are exported with specific
+# names so that the other task related CF templates can use them.
+Outputs:
+  EcsTaskName:
+    Description: The name of the task definiton
+    Value: !Ref 'Task'
+    Export:
+      Name: !Sub ${EnvironmentName}:${ServiceName}:Task
+  EcsServiceName:
+    Description: The name of the service deployed
+    Value: !GetAtt 'Service.Name'
+    Export:
+      Name: !Sub ${EnvironmentName}:${ServiceName}:Service
+  TaskRole:
+    Description: The ARN of the ECS role for the container
+    Value: !GetAtt 'TaskRole.Arn'
+    Export:
+      Name: !Sub ${EnvironmentName}:${ServiceName}:TaskRole
+  AlbDomain:
+    Description: The domain name that can be used as the URL for the service.
+    Value: !GetAtt 'ALB.DNSName'
+    Export:
+      Name: !Sub ${EnvironmentName}:${ServiceName}:DomainName
